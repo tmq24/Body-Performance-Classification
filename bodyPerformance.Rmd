@@ -1,0 +1,793 @@
+---
+title: "Body Performance Classification"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r include=FALSE}
+library(tidyverse)
+library(janitor)       
+library(corrplot)       
+library(gridExtra)     
+library(nnet)          
+library(caret)        
+library(rpart.plot)    
+library(randomForest)
+library(xgboost)
+library(themis)
+library(tidymodels)
+library(VIM)
+library(lmPerm)
+```
+
+## Read data
+
+```{r}
+data <- read.csv("bodyPerformance.csv")
+data <- clean_names(data)
+```
+
+------------------------------------------------------------------------
+
+## **Statistical description of the dataset**
+
+### Check the structure of the data
+
+```{r}
+dim(data)
+glimpse(data)
+```
+
+### Statistical description of the data
+
+```{r}
+summary(data)
+```
+
+### Define numerical and categorical features
+
+```{r}
+numerical_features <- c("age", "height_cm", "weight_kg", "body_fat", "diastolic", "systolic",
+                        "grip_force", "sit_and_bend_forward_cm", "sit_ups_counts",
+                        "broad_jump_cm")
+
+categorical_features <- c("gender", "class")
+```
+
+------------------------------------------------------------------------
+
+## **Data preprocessing**
+
+### Check missing data
+
+```{r}
+na_percentage <- colSums(is.na(data)) / nrow(data) * 100
+na_percentage
+
+aggr(data, ylab = c("Proportion of missings", "Pattern"), number = TRUE,
+cex.axis = 0.6, cex.numbers = 0.5)
+```
+
+-   There is no missing data.
+
+### Check duplicate data
+
+```{r}
+sum(duplicated(data))
+data[duplicated(data), ]
+```
+
+-   There is 1 duplicate row.
+-   With only 1 duplicate row, the impact on the overall analysis may not be significant. However, keeping duplicate rows may lead to slight bias in descriptive statistics or modeling.
+
+#### Remove duplicate rows
+
+```{r}
+data <- data[!duplicated(data), ]
+
+dim(data)
+
+sum(duplicated(data))
+```
+
+### Check outliers
+
+```{r, fig.width=15, fig.height=12}
+boxplot_list <- list()
+
+for (feature in numerical_features) {
+  p <- ggplot(data, aes(x = "", y = .data[[feature]])) +
+    geom_boxplot(fill = "lightblue", color = "darkblue", alpha = 0.7, 
+                 width = 0.5, outlier.size = 3) +  
+    labs(title = feature) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"), 
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank(),
+      axis.title = element_blank(),
+      axis.text.x = element_blank(),
+      axis.text.y = element_text(size = 12) 
+    )
+  boxplot_list[[feature]] <- p
+}
+
+
+grid.arrange(
+  grobs = boxplot_list, 
+  ncol = 3, 
+  nrow = 4,
+  top = textGrob(
+    "Boxplots of Numerical Features", 
+    gp = gpar(fontsize = 20, fontface = "bold")  
+  ),
+  padding = unit(2, "line")  
+)
+```
+
+-   Quick note:
+    -   Most variables have outliers
+    -   Special variables diastolic, systolic, body_fat, sit_and_bend_forward_cm have outliers that are unreasonable with the real world
+    -   Consider removing outliers or replacing them
+
+#### Handle outliers
+
+```{r}
+# Remove outliers based on IQR
+remove_outliers <- function(column) {
+  Q1 <- quantile(column, 0.25, na.rm = TRUE)
+  Q3 <- quantile(column, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  column >= lower_bound & column <= upper_bound
+}
+
+# Winsorization function
+winsorize <- function(column) {
+  Q1 <- quantile(column, 0.25, na.rm = TRUE)
+  Q3 <- quantile(column, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  column[column < lower_bound] <- lower_bound
+  column[column > upper_bound] <- upper_bound
+  return(column)
+}
+
+# Start processing data
+data <- data %>%
+  # Remove outliers of diastolic and systolic
+  filter(remove_outliers(diastolic), remove_outliers(systolic)) %>%
+  # Remove negative values and outliers of sit_and_bend_forward_cm
+  filter(sit_and_bend_forward_cm >= 0) %>%
+  filter(remove_outliers(sit_and_bend_forward_cm)) %>%
+  # BWinsorization cho body_fat
+  mutate(body_fat = winsorize(body_fat))
+
+
+summary(data)
+```
+
+```{r}
+for (feature in c("diastolic", "systolic", "sit_and_bend_forward_cm", "body_fat")) {
+  print(
+    ggplot(data, aes(x = "", y = .data[[feature]])) +
+      geom_boxplot(fill = "skyblue", color = "black") +
+      labs(title = paste("Boxplot after Outlier Handling:", feature), x = "", y = feature) +
+      theme_minimal()
+  )
+}
+```
+
+## **Visualize cleaned data**
+
+### Gender and class distribution
+
+```{r}
+ggplot(data, aes(x = gender)) +
+  geom_bar(fill = "blue") +
+  coord_flip() +  
+  geom_text(stat = "count", aes(label = after_stat(count)), hjust = -0.2, color = "white") +
+  labs(title = "Gender Distribution", x = "Gender", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 15, face = "bold"))
+```
+
+```{r}
+ggplot(data, aes(x = class)) +
+  geom_bar(fill = "blue") +
+  coord_flip() +  
+  geom_text(stat = "count", aes(label = after_stat(count)), hjust = -0.2, color = "white") +
+  labs(title = "Class Distribution", x = "Performance Class", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 15, face = "bold"))
+
+```
+
+```{r}
+table( data$class)
+```
+
+-   After processing, class D is imbalanced compared to other classes.
+
+### Frequency and density plot of each numerical variable
+
+```{r, fig.width=15, fig.height=12}
+hist_plots <- list()
+
+for (var in numerical_features) {
+  p <- ggplot(data, aes(x = .data[[var]])) +
+    geom_histogram(aes(y = after_stat(density)), 
+                  fill = "skyblue", 
+                  color = "darkblue",
+                  alpha = 0.7,
+                  bins = 30) +
+    geom_density(color = "red", linewidth = 1.2) +  
+    labs(title = var) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank(),
+      axis.title.x = element_blank(),
+      axis.title.y = element_text(size = 12),
+      axis.text = element_text(size = 12)
+    )
+  hist_plots[[var]] <- p
+}
+
+grid.arrange(
+  grobs = hist_plots, 
+  ncol = 3, 
+  nrow = 4,
+  top = textGrob(
+    "Distribution of Numerical Features", 
+    gp = gpar(fontsize = 20, fontface = "bold")
+  ),
+  padding = unit(2, "line")
+)
+```
+
+### Correlation heatmap
+
+```{r}
+numeric_df <- data[, numerical_features]
+cor_body <- cor(numeric_df, method = "pearson")
+cor_body
+```
+
+```{r}
+corrplot(cor_body)
+```
+
+## Perform some tests
+
+### Boxplot and violin plot for variables
+
+```{r, fig.width=15, fig.height=12}
+violin_box_list <- list()
+
+for(var in numerical_features) {
+  violin_box_list[[var]] <- ggplot(data, aes(x = class, y = .data[[var]], fill = class)) +
+    geom_violin(alpha = 0.5) +
+    geom_boxplot(width = 0.2, alpha = 0.7) +
+    scale_fill_brewer(palette = "Set3") +  
+    labs(
+      title = paste(var),
+      x = "Performance Class",
+      y = var
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, hjust = 0.5),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      panel.grid.major.y = element_line(color = "grey90", size = 0.3)
+    )
+}
+
+grid.arrange(
+  grobs = violin_box_list, 
+  ncol = 3, 
+  nrow = 4,
+  top = textGrob(
+    "Distribution by Performance Class",
+    gp = gpar(fontsize = 16, fontface = "bold")
+  ),
+  padding = unit(2, "line")
+)
+```
+
+### Compare variables between performance classes
+
+```{r}
+set.seed(54)
+
+anova_results <- list()
+plot_list <- list()
+
+for(i in numerical_features) {
+    out_aov <- aovp(formula = data[[i]] ~ class, data = data, perm = "Prob")
+    anova_results[[i]] <- summary(out_aov)
+    
+    p <- ggplot(data, aes(x = class, y = .data[[i]], fill = class)) +
+        geom_boxplot() +
+        labs(title = paste("Distribution of", i, "by Performance Class"),
+             x = "Performance Class",
+             y = i) +
+        theme_minimal() +
+        theme(legend.position = "none") +
+        scale_fill_brewer(palette = "Set3")
+    
+    plot_list[[i]] <- p
+    
+    # ANOVA results
+    print(paste("ANOVA Results for", i))
+    print(summary(out_aov))
+    cat("\n--------------------------------------------------------------\n")
+}
+
+anova_summary <- data.frame(
+    Variable = character(),
+    F_value = numeric(),
+    P_value = numeric(),
+    Significant = character(),
+    stringsAsFactors = FALSE
+)
+
+```
+
+-   All variables have very small p-value, indicating that the difference is statistically significant.
+
+-   **Analysis by variable group**:
+
+    -   **Strength indicators** (grip_force, broad_jump_cm):
+
+        -   Clear difference between classes
+
+        -   Class A and B show outstanding superiority
+
+-   **Endurance indicators** (sit_ups_counts):
+
+    -   Clear difference between classes
+
+    -   Class A shows outstanding superiority
+
+-   **Body composition indicators** (body_fat, weight_kg):
+
+    -   Clear difference between classes
+
+    -   Class A shows outstanding superiority
+
+**Meaning**: - All variables have very small p-value, indicating that the difference is statistically significant. - Strength indicators (grip_force, broad_jump_cm): Clear difference between classes - Class A and B show outstanding superiority - Endurance indicators (sit_ups_counts): Clear difference between classes - Class A shows outstanding superiority - Body composition indicators (body_fat, weight_kg): Clear difference between classes - Class A shows outstanding superiority
+
+#### Analyze the characteristics of the high performance group (Class A)
+
+```{r}
+# Compare indices between Class A and other classes
+class_comparison <- data %>%
+  mutate(performance_group = ifelse(class == "A", "High Performance", "Others")) %>%
+  group_by(performance_group) %>%
+  summarise(
+    avg_age = mean(age),
+    avg_body_fat = mean(body_fat),
+    avg_grip_force = mean(grip_force),
+    avg_sit_ups = mean(sit_ups_counts),
+    avg_broad_jump = mean(broad_jump_cm)
+  )
+
+# Visualize the difference
+class_comparison_long <- class_comparison %>%
+  pivot_longer(cols = starts_with("avg_"),
+               names_to = "metric",
+               values_to = "value")
+
+ggplot(class_comparison_long, 
+       aes(x = metric, y = value, fill = performance_group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(title = "Characteristics of High Performance Group vs Others",
+       x = "Metrics",
+       y = "Average Value") +
+  theme_minimal()
+```
+
+### Analyze the impact of gender on performance
+
+```{r}
+important_vars <- c("age", "body_fat", "grip_force", "sit_ups_counts", "broad_jump_cm")
+
+# Perform permutation ANOVA for gender x class interaction
+cat("Two-way permutation ANOVA (Gender x Class):\n")
+
+for(var in important_vars) {
+    formula <- as.formula(paste(var, "~ gender * class"))
+    out_aov <- aovp(formula, data = data, perm = "Prob")
+    cat(sprintf("\nTwo-way permutation ANOVA for %s:\n", var))
+    print(summary(out_aov))
+}
+
+data_long <- data %>%
+  pivot_longer(cols = all_of(important_vars),
+               names_to = "variable",
+               values_to = "value")
+
+ggplot(data_long, aes(x = class, y = value, fill = gender)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Distribution of metrics by class and gender",
+       x = "Class",
+       y = "Value") +
+  theme_minimal()
+
+performance_stats <- data %>%
+  group_by(gender, class) %>%
+  summarise(
+    count = n(),
+    avg_age = mean(age),
+    avg_body_fat = mean(body_fat),
+    avg_grip_force = mean(grip_force),
+    avg_sit_ups = mean(sit_ups_counts),
+    avg_broad_jump = mean(broad_jump_cm)
+  ) %>%
+  group_by(gender) %>%
+  mutate(percentage = count/sum(count) * 100)
+
+print("\nStatistics by gender and class:")
+print(performance_stats)
+
+```
+
+**Note:**
+
+1.  **Role of gender in physical performance**:
+    -   Gender is a strong factor affecting all physical indices.
+    -   All p-values \< 2.2e-16, indicating that the difference between men and women is statistically significant.
+    -   Men generally have an advantage in physical performance, particularly in indices such as grip strength and jump distance.
+2.  **Class differentiation**:
+    -   There is a clear difference between classes in all physical indices.
+    -   The gap in physical performance between men and women increases as the class level increases.
+    -   Class A stands out with outstanding physical indices and low body fat percentage.
+3.  **Gender interaction with class**:
+    -   The difference between men and women is not uniform across classes.
+    -   The gap in physical performance between men and women increases as the class level increases.
+    -   This suggests that men and women may need different training programs to optimize development.
+4.  **Practical meaning**:
+    -   Need to build individual training programs for men and women.
+
+------------------------------------------------------------------------
+
+## **Model**
+
+Model evaluation function
+
+```{r}
+eval_multi_class <- function(x) {
+  cc <- sum(diag(x))               
+  sc <- sum(x)                      
+  pp <- colSums(x)                 
+  tt <- rowSums(x)                 
+  
+  # Precision and Recall for each class
+  prec <- diag(x) / pp
+  recall <- diag(x) / tt
+  
+  # Macro Precision, Recall and F1
+  macro_prec <- mean(prec, na.rm = TRUE)
+  macro_recall <- mean(recall, na.rm = TRUE)
+  macro_f1 <- 2 * macro_prec * macro_recall / (macro_prec + macro_recall)
+  
+  # Accuracy
+  acc <- cc / sc
+  
+  # Kappa
+  kap <- (cc * sc - sum(pp * tt)) / (sc^2 - sum(pp * tt))
+  
+  return(list(
+    Precision = prec,
+    Recall = recall,
+    Accuracy = acc,
+    Kappa = kap,
+    Macro_F1 = macro_f1
+  ))
+}
+
+```
+
+### Data split
+
+```{r}
+set.seed(123)
+split <- initial_split(data, prop = 0.8, strata = class)
+train <- training(split)
+test <- testing(split)
+
+cat("Train size: ", dim(train), "\n")
+cat("Test size: ", dim(test), "\n")
+
+```
+
+```{r}
+# Check data type
+str(train$class)
+str(test$class)
+
+# Convert categorical variables to factor
+train <- train %>%
+  mutate(
+    class = as.factor(class),
+    gender = as.factor(gender)
+  )
+
+test <- test %>%
+  mutate(
+    class = as.factor(class),
+    gender = as.factor(gender)
+  )
+str(train$class)
+str(test$class)
+```
+
+### Balance data with SMOTE
+
+```{r}
+library(themis)
+library(recipes)
+library(tidymodels)
+
+original_distribution <- table(train$class)
+
+recipe_obj <- recipe(class ~ ., data = train) %>%
+  step_smotenc(class)  
+
+data_balanced <- prep(recipe_obj) %>%
+  bake(new_data = NULL)
+
+cat("Distribution of class before balancing:\n")
+print(original_distribution)
+
+cat("\nDistribution of class after balancing:\n")
+print(table(data_balanced$class))
+
+# Visualization
+p1 <- ggplot(train, aes(x = class)) +
+  geom_bar(fill = "skyblue") +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  labs(title = "Before balancing",
+       x = "Class",
+       y = "Count") +
+  theme_minimal()
+
+p2 <- ggplot(data_balanced, aes(x = class)) +
+  geom_bar(fill = "salmon") +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  labs(title = "After balancing",
+       x = "Class",
+       y = "Count") +
+  theme_minimal()
+
+# Display both plots
+library(gridExtra)
+grid.arrange(p1, p2, ncol = 2)
+
+summary(data_balanced)
+
+
+data <- data_balanced
+
+```
+
+### Multinomial Logistic Regression
+
+#### Multinomial Logistic Regression without feature transformation
+
+```{r}
+multinom_model <- multinom(class ~ ., data = train, maxit = 100)
+pred <-  predict(multinom_model, newdata = test, type = "class")
+head(pred)
+```
+
+```{r}
+# confusion matrix
+multinom_conf_mat <- tibble(
+  truth = test$class,
+  prediction = pred
+) %>%
+  conf_mat(truth = truth, estimate = prediction)
+
+# Evaluate model
+metrics_multinom <- eval_multi_class(multinom_conf_mat$table)
+print(metrics_multinom)
+
+# Visualization
+autoplot(multinom_conf_mat, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix - Multinomial Logistic Regression")
+```
+
+#### Train Multinomial Logistic Regression model with interaction, log, and square transformations
+
+```{r}
+multinom_model_simplified <- multinom(
+  class ~ gender + age + diastolic + systolic + height_cm +
+    I(log(grip_force + 1)) +
+    I(log(sit_ups_counts + 1)) +
+    I(log(broad_jump_cm + 1)) +
+    I(weight_kg * (body_fat/100)) +
+    sit_and_bend_forward_cm,
+  data = train, 
+  maxit = 1000
+)
+pred_simplified <- predict(multinom_model_simplified, newdata = test, type = "class")
+head(pred_simplified)
+```
+
+```{r}
+# Confusion Matrix
+multinom_conf_mat_simplified <- tibble(
+  truth = test$class,
+  prediction = pred_simplified
+) %>%
+  conf_mat(truth = truth, estimate = prediction)
+
+print(multinom_conf_mat_simplified)
+# Evaluate model
+metrics_simplified <-eval_multi_class(multinom_conf_mat_simplified$table)
+print(metrics_simplified)
+
+# Visualization
+autoplot(multinom_conf_mat_simplified, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix - Simplified Multinomial Model")
+
+```
+
+### Random Forest
+
+```{r}
+library(randomForest)
+rf_model <- randomForest(class ~ ., data = train)
+pred_rf <- predict(rf_model, newdata = test, type = "class")
+head(pred_rf)
+```
+
+```{r}
+# Confusion Matrix
+rf_conf_mat <- tibble(
+  truth = test$class,
+  prediction = pred_rf
+) %>%
+  conf_mat(truth = truth, estimate = prediction)
+
+print(rf_conf_mat)
+
+# Evaluate model
+metrics_rf <- eval_multi_class(rf_conf_mat$table)
+print(metrics_rf)
+
+# Visualization
+autoplot(rf_conf_mat, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix - Random Forest")
+```
+
+### Training XGBoost
+
+```{r}
+library(xgboost)
+
+# Prepare data
+# Encoding class (A=0, B=1, C=2, D=3)
+train$class_num <- as.numeric(factor(train$class, levels = c("A", "B", "C", "D"))) - 1
+test$class_num <- as.numeric(factor(test$class, levels = c("A", "B", "C", "D"))) - 1
+
+# Encoding gender (Female=0, Male=1)
+train$gender_num <- ifelse(train$gender == "M", 1, 0)
+test$gender_num <- ifelse(test$gender == "M", 1, 0)
+
+# Choose numeric features
+feature_cols <- c("age", "height_cm", "weight_kg", "body_fat", "diastolic", 
+                 "systolic", "grip_force", "sit_and_bend_forward_cm", 
+                 "sit_ups_counts", "broad_jump_cm", "gender_num")
+
+# Convert data to matrix
+train_matrix <- as.matrix(train[, feature_cols])
+test_matrix <- as.matrix(test[, feature_cols])
+
+# Train model
+xgb_model <- xgboost(data = train_matrix,
+                     label = train$class_num,
+                     nrounds = 100,
+                     objective = "multi:softmax",
+                     num_class = 4,
+                     eta = 0.3,
+                     max_depth = 6)
+
+# Predict
+pred_xgb_num <- predict(xgb_model, test_matrix)
+# Convert prediction to factor with correct order
+pred_xgb <- factor(pred_xgb_num, levels = 0:3, labels = c("A", "B", "C", "D"))
+```
+
+```{r}
+# Confusion Matrix
+xgb_conf_mat <- tibble(
+  truth = test$class,
+  prediction = factor(pred_xgb, levels = levels(test$class))
+) %>%
+  conf_mat(truth = truth, estimate = prediction)
+
+print(xgb_conf_mat)
+
+# Evaluate model
+metrics_xgb <- eval_multi_class(xgb_conf_mat$table)
+print(metrics_xgb)
+
+# Visualization
+autoplot(xgb_conf_mat, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix - XGBoost")
+```
+
+### Model comparison
+
+```{r}
+comparison <- data.frame(
+  Model = c("Basic Multinomial", "Simplified Multinomial", "Random Forest", "XGBoost"),
+  Accuracy = c(metrics_multinom$Accuracy, metrics_simplified$Accuracy, 
+               metrics_rf$Accuracy, metrics_xgb$Accuracy),
+  Kappa = c(metrics_multinom$Kappa, metrics_simplified$Kappa, 
+            metrics_rf$Kappa, metrics_xgb$Kappa),
+  Macro_F1 = c(metrics_multinom$Macro_F1, metrics_simplified$Macro_F1, 
+               metrics_rf$Macro_F1, metrics_xgb$Macro_F1)
+)
+print(comparison)
+```
+
+### Feature importance
+
+```{r}
+# 1.Multinomial
+basic_importance <- varImp(multinom_model)
+ggplot(data = data.frame(
+  Feature = rownames(basic_importance),
+  Importance = basic_importance[,1]
+)) +
+  geom_bar(aes(x = reorder(Feature, Importance), y = Importance), stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Feature Importance - Basic Multinomial",
+       x = "Features", y = "Importance") +
+  theme_minimal()
+
+# 2. Simplified Multinomial
+simplified_importance <- varImp(multinom_model_simplified)
+ggplot(data = data.frame(
+  Feature = rownames(simplified_importance),
+  Importance = simplified_importance[,1]
+)) +
+  geom_bar(aes(x = reorder(Feature, Importance), y = Importance), stat = "identity", fill = "lightgreen") +
+  coord_flip() +
+  labs(title = "Feature Importance - Simplified Multinomial",
+       x = "Features", y = "Importance") +
+  theme_minimal()
+
+# 3. Random Forest
+varImpPlot(rf_model, 
+           sort = TRUE,
+           main = "Feature Importance - Random Forest",
+           n.var = min(10, ncol(train)))
+
+# 4. XGBoost
+importance_matrix <- xgb.importance(
+  feature_names = feature_cols,
+  model = xgb_model
+)
+xgb.plot.importance(importance_matrix, top_n = 10,
+                   main = "Feature Importance - XGBoost")
+```
